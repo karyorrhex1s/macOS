@@ -1,0 +1,697 @@
+#!/usr/bin/env python3
+"""
+SecureNetMonitor - Advanced Network Traffic Analysis for Security Research
+
+A comprehensive network traffic analysis tool designed for security researchers
+to detect anomalous network behavior, potential exploitation attempts, and
+cryptocurrency mining activity.
+
+Features:
+- Real-time packet inspection and anomaly detection
+- Crypto mining signature detection
+- Connection tracking and statistical analysis
+- Port scan detection
+- Behavioral analysis to identify covert channels
+"""
+
+import argparse
+import datetime
+import ipaddress
+import json
+import logging
+import os
+import re
+import signal
+import socket
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+from collections import Counter, defaultdict
+from typing import Dict, List, Set, Tuple, Optional, Any
+
+try:
+    import scapy.all as scapy
+    from scapy.layers import http, inet
+except ImportError:
+    print("Error: Required packages not installed.")
+    print("Please install required packages with: pip install scapy")
+    sys.exit(1)
+
+# ---------- Configuration ----------
+HOME_DIR = os.path.expanduser("~")
+CONFIG_DIR = os.path.join(HOME_DIR, "secOPS", "security", "config")
+LOG_DIR = os.path.join(HOME_DIR, "secOPS", "network", "logs")
+DB_PATH = os.path.join(CONFIG_DIR, "network_analysis.db")
+
+# Ensure directories exist
+os.makedirs(CONFIG_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
+
+# Set appropriate permissions
+os.chmod(CONFIG_DIR, 0o700)
+os.chmod(LOG_DIR, 0o700)
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(os.path.join(LOG_DIR, "network_monitor.log")),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("SecureNetMonitor")
+
+# ---------- Threat Intelligence ----------
+# Common crypto mining pool domains and patterns
+CRYPTO_MINING_INDICATORS = [
+    r'xmr\.pool\.', r'monero\.', r'xmrig\.', r'nanopool\.', r'miningpoolhub\.',
+    r'nicehash\.', r'minergate\.', r'supportxmr\.', r'dwarfpool\.', r'cryptonight',
+    r'stratum\+tcp', r'eth\.pool', r'zcash\.', r'flypool\.', r'ethermine\.',
+    r'ethereum\.', r'hiveon\.'
+]
+
+# Common crypto mining ports
+CRYPTO_MINING_PORTS = {
+    3333, 5555, 7777, 8888, 9999,  # Common XMR ports
+    8545, 8546, 30303,             # Ethereum related
+    3357, 5000, 5755, 5766, 5777,  # Various mining protocols
+    8332, 8333                     # Bitcoin 
+}
+
+# ---------- Database Setup ----------
+def init_database():
+    """Initialize SQLite database for persistent storage and analysis."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # Connection tracking table
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS connections (
+        id INTEGER PRIMARY KEY,
+        timestamp TEXT,
+        src_ip TEXT,
+        src_port INTEGER,
+        dst_ip TEXT,
+        dst_port INTEGER,
+        protocol TEXT,
+        packets INTEGER,
+        bytes INTEGER,
+        duration REAL,
+        flags TEXT,
+        status TEXT
+    )
+    ''')
+    
+    # Anomaly detection table
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS anomalies (
+        id INTEGER PRIMARY KEY,
+        timestamp TEXT,
+        type TEXT,
+        severity INTEGER,
+        details TEXT,
+        raw_data TEXT
+    )
+    ''')
+    
+    # Host behavior table
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS host_behavior (
+        ip TEXT PRIMARY KEY,
+        first_seen TEXT,
+        last_seen TEXT,
+        total_connections INTEGER,
+        total_bytes_sent INTEGER,
+        total_bytes_received INTEGER,
+        ports_contacted TEXT,
+        user_agent TEXT,
+        notes TEXT
+    )
+    ''')
+    
+    conn.commit()
+    conn.close()
+    
+    # Set proper permissions for the database
+    os.chmod(DB_PATH, 0o600)
+    
+    logger.info(f"Database initialized at {DB_PATH}")
+
+# ---------- Network Monitoring ----------
+class ConnectionTracker:
+    """Tracks network connections and identifies patterns."""
+    
+    def __init__(self):
+        self.connections = defaultdict(dict)
+        self.connection_stats = defaultdict(Counter)
+        self.port_scan_threshold = 15  # Number of ports in short time to trigger alert
+        self.scan_window = 60  # Seconds to consider for port scan detection
+        self.lock = threading.Lock()
+        self.local_networks = self._get_local_networks()
+        
+    def _get_local_networks(self) -> List[str]:
+        """Get local network ranges."""
+        try:
+            result = subprocess.run(
+                ["ifconfig"], capture_output=True, text=True, check=True
+            )
+            # Find all inet addresses
+            inet_pattern = r'inet (\d+\.\d+\.\d+\.\d+)'
+            addresses = re.findall(inet_pattern, result.stdout)
+            
+            # Convert to network ranges (simplified approach)
+            networks = []
+            for addr in addresses:
+                if not addr.startswith(('127.', '169.254.')):  # Skip localhost and link-local
+                    networks.append(f"{addr.rsplit('.', 1)[0]}.0/24")
+            
+            return networks
+        except Exception as e:
+            logger.error(f"Failed to determine local networks: {e}")
+            # Default to common private networks
+            return ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+    
+    def is_local_ip(self, ip: str) -> bool:
+        """Check if IP is in a local network range."""
+        try:
+            ip_obj = ipaddress.ip_address(ip)
+            for network in self.local_networks:
+                if ip_obj in ipaddress.ip_network(network):
+                    return True
+            return False
+        except ValueError:
+            return False  # Invalid IP address
+            
+    def record_packet(self, packet) -> None:
+        """Record a packet and update connection tracking."""
+        with self.lock:
+            if scapy.IP in packet:
+                src_ip = packet[scapy.IP].src
+                dst_ip = packet[scapy.IP].dst
+                protocol = packet[scapy.IP].proto
+                
+                # Get ports if applicable
+                src_port = dst_port = None
+                if scapy.TCP in packet:
+                    src_port = packet[scapy.TCP].sport
+                    dst_port = packet[scapy.TCP].dport
+                    flags = packet[scapy.TCP].flags
+                    # Record for port scan detection
+                    if flags & 0x02:  # SYN flag
+                        key = f"{src_ip}_{int(time.time() // self.scan_window)}"
+                        self.connection_stats[key][dst_port] += 1
+                        # Check for port scan
+                        if len(self.connection_stats[key]) >= self.port_scan_threshold:
+                            self._record_anomaly(
+                                "PORT_SCAN", 
+                                3, 
+                                f"Possible port scan from {src_ip}: {len(self.connection_stats[key])} ports in {self.scan_window}s",
+                                {"source": src_ip, "ports": list(self.connection_stats[key].keys())}
+                            )
+                elif scapy.UDP in packet:
+                    src_port = packet[scapy.UDP].sport
+                    dst_port = packet[scapy.UDP].dport
+                
+                # Skip if we couldn't determine ports
+                if not (src_port and dst_port):
+                    return
+                
+                # Create connection key
+                conn_key = f"{src_ip}:{src_port}-{dst_ip}:{dst_port}-{protocol}"
+                packet_size = len(packet)
+                
+                # Update or create connection record
+                if conn_key not in self.connections:
+                    self.connections[conn_key] = {
+                        'start_time': time.time(),
+                        'last_time': time.time(),
+                        'src_ip': src_ip,
+                        'src_port': src_port,
+                        'dst_ip': dst_ip,
+                        'dst_port': dst_port,
+                        'protocol': protocol,
+                        'packets': 1,
+                        'bytes': packet_size,
+                        'flags': []
+                    }
+                else:
+                    self.connections[conn_key]['last_time'] = time.time()
+                    self.connections[conn_key]['packets'] += 1
+                    self.connections[conn_key]['bytes'] += packet_size
+                
+                # Check for crypto mining indicators
+                if dst_port in CRYPTO_MINING_PORTS:
+                    confidence = 0.3  # Base confidence
+                    
+                    # Increase confidence if destination is not local
+                    if not self.is_local_ip(dst_ip):
+                        confidence += 0.2
+                    
+                    # Check packet payload for mining signatures
+                    if scapy.Raw in packet:
+                        payload = packet[scapy.Raw].load.decode('latin-1', errors='ignore')
+                        for pattern in CRYPTO_MINING_INDICATORS:
+                            if re.search(pattern, payload, re.IGNORECASE):
+                                confidence += 0.3
+                                break
+                    
+                    if confidence >= 0.5:
+                        self._record_anomaly(
+                            "CRYPTO_MINING",
+                            int(confidence * 5),  # Convert to 1-5 scale
+                            f"Potential crypto mining activity detected",
+                            {
+                                "src_ip": src_ip,
+                                "dst_ip": dst_ip,
+                                "dst_port": dst_port,
+                                "confidence": confidence
+                            }
+                        )
+    
+    def _record_anomaly(self, anomaly_type: str, severity: int, details: str, data: Dict[str, Any]) -> None:
+        """Record an anomaly in the database."""
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+            INSERT INTO anomalies (timestamp, type, severity, details, raw_data)
+            VALUES (?, ?, ?, ?, ?)
+            ''', (
+                datetime.datetime.now().isoformat(),
+                anomaly_type,
+                severity,
+                details,
+                json.dumps(data)
+            ))
+            
+            conn.commit()
+            conn.close()
+            
+            logger.warning(f"ANOMALY DETECTED: {details} [Severity: {severity}/5]")
+        except Exception as e:
+            logger.error(f"Failed to record anomaly: {e}")
+    
+    def save_connections(self) -> None:
+        """Save connections to database and prune old ones."""
+        current_time = time.time()
+        to_prune = []
+        
+        with self.lock:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            
+            for key, connection in self.connections.items():
+                # If connection hasn't seen activity in 5 minutes, save and prune
+                if current_time - connection['last_time'] > 300:
+                    duration = connection['last_time'] - connection['start_time']
+                    
+                    cursor.execute('''
+                    INSERT INTO connections 
+                    (timestamp, src_ip, src_port, dst_ip, dst_port, protocol, packets, bytes, duration, flags, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        datetime.datetime.fromtimestamp(connection['start_time']).isoformat(),
+                        connection['src_ip'],
+                        connection['src_port'],
+                        connection['dst_ip'],
+                        connection['dst_port'],
+                        connection['protocol'],
+                        connection['packets'],
+                        connection['bytes'],
+                        duration,
+                        str(connection.get('flags', [])),
+                        'COMPLETED'
+                    ))
+                    
+                    to_prune.append(key)
+            
+            # Also prune connection stats older than scan window
+            current_window = int(time.time() // self.scan_window)
+            stats_to_prune = []
+            for key in self.connection_stats:
+                key_parts = key.split('_')
+                if len(key_parts) == 2:
+                    window = int(key_parts[1])
+                    if current_window - window > 1:  # Older than 1 window
+                        stats_to_prune.append(key)
+            
+            for key in stats_to_prune:
+                del self.connection_stats[key]
+            
+            conn.commit()
+            conn.close()
+            
+            # Prune old connections
+            for key in to_prune:
+                del self.connections[key]
+                
+            if to_prune:
+                logger.debug(f"Pruned {len(to_prune)} completed connections")
+
+class PacketProcessor:
+    """Process network packets for analysis and detection."""
+    
+    def __init__(self):
+        self.stop_flag = threading.Event()
+        self.conn_tracker = ConnectionTracker()
+        self.sniffer = None
+        self.save_thread = None
+    
+    def start_monitoring(self, interface: str = None) -> None:
+        """Start monitoring network traffic."""
+        self.stop_flag.clear()
+        
+        # Start connection saver thread
+        self.save_thread = threading.Thread(target=self._connection_saver)
+        self.save_thread.daemon = True
+        self.save_thread.start()
+        
+        # Setup packet sniffer
+        try:
+            logger.info(f"Starting network monitoring on interface {interface or 'default'}")
+            self.sniffer = scapy.AsyncSniffer(
+                iface=interface,
+                prn=self.conn_tracker.record_packet,
+                store=False,
+                filter="ip"  # Only IP packets
+            )
+            self.sniffer.start()
+        except Exception as e:
+            logger.error(f"Failed to start packet sniffer: {e}")
+            self.stop_flag.set()
+            raise
+    
+    def stop_monitoring(self) -> None:
+        """Stop monitoring network traffic."""
+        self.stop_flag.set()
+        if self.sniffer:
+            self.sniffer.stop()
+        
+        # Wait for save thread to finish
+        if self.save_thread and self.save_thread.is_alive():
+            self.save_thread.join(timeout=3)
+            
+        # Final save of remaining connections
+        self.conn_tracker.save_connections()
+        logger.info("Network monitoring stopped")
+    
+    def _connection_saver(self) -> None:
+        """Periodically save connection data to database."""
+        while not self.stop_flag.is_set():
+            try:
+                self.conn_tracker.save_connections()
+            except Exception as e:
+                logger.error(f"Error in connection saver: {e}")
+            
+            # Sleep for 30 seconds or until stop flag is set
+            self.stop_flag.wait(30)
+
+
+# ---------- Analysis and Reporting ----------
+class NetworkAnalyzer:
+    """Analyzes collected network data for patterns and anomalies."""
+    
+    def __init__(self):
+        self.conn = sqlite3.connect(DB_PATH)
+        self.conn.row_factory = sqlite3.Row
+    
+    def close(self):
+        """Close database connection."""
+        if self.conn:
+            self.conn.close()
+    
+    def get_recent_anomalies(self, limit: int = 10) -> List[Dict]:
+        """Get the most recent anomalies."""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+        SELECT * FROM anomalies
+        ORDER BY timestamp DESC
+        LIMIT ?
+        ''', (limit,))
+        
+        return [dict(row) for row in cursor.fetchall()]
+    
+    def get_connection_stats(self) -> Dict:
+        """Get statistics about network connections."""
+        cursor = self.conn.cursor()
+        
+        # Get total connections
+        cursor.execute('SELECT COUNT(*) FROM connections')
+        total_connections = cursor.fetchone()[0]
+        
+        # Get top talkers (IPs with most connections)
+        cursor.execute('''
+        SELECT src_ip, COUNT(*) as count
+        FROM connections
+        GROUP BY src_ip
+        ORDER BY count DESC
+        LIMIT 10
+        ''')
+        top_talkers = [dict(row) for row in cursor.fetchall()]
+        
+        # Get top destination ports
+        cursor.execute('''
+        SELECT dst_port, COUNT(*) as count
+        FROM connections
+        GROUP BY dst_port
+        ORDER BY count DESC
+        LIMIT 10
+        ''')
+        top_ports = [dict(row) for row in cursor.fetchall()]
+        
+        # Get bandwidth usage
+        cursor.execute('SELECT SUM(bytes) FROM connections')
+        total_bytes = cursor.fetchone()[0] or 0
+        
+        return {
+            'total_connections': total_connections,
+            'top_talkers': top_talkers,
+            'top_ports': top_ports,
+            'total_bytes': total_bytes
+        }
+    
+    def generate_report(self) -> str:
+        """Generate a comprehensive report of findings."""
+        anomalies = self.get_recent_anomalies(20)
+        stats = self.get_connection_stats()
+        
+        report = [
+            "======== SECURITY NETWORK ANALYSIS REPORT ========",
+            f"Generated: {datetime.datetime.now().isoformat()}",
+            "",
+            f"Total Connections: {stats['total_connections']}",
+            f"Total Data Transferred: {stats['total_bytes'] / (1024*1024):.2f} MB",
+            "",
+            "--- TOP TALKERS ---"
+        ]
+        
+        for talker in stats['top_talkers']:
+            report.append(f"{talker['src_ip']}: {talker['count']} connections")
+        
+        report.extend([
+            "",
+            "--- TOP DESTINATION PORTS ---"
+        ])
+        
+        for port in stats['top_ports']:
+            report.append(f"Port {port['dst_port']}: {port['count']} connections")
+        
+        report.extend([
+            "",
+            "--- RECENT ANOMALIES ---"
+        ])
+        
+        if anomalies:
+            for anomaly in anomalies:
+                report.append(f"[{anomaly['timestamp']}] {anomaly['type']} (Severity: {anomaly['severity']}/5)")
+                report.append(f"  Details: {anomaly['details']}")
+                report.append("")
+        else:
+            report.append("No anomalies detected")
+        
+        return "\n".join(report)
+
+# ---------- Command Line Interface ----------
+class NetworkMonitorCLI:
+    """Command-line interface for the network monitoring tool."""
+    
+    def __init__(self):
+        self.processor = None
+        self.analyzer = NetworkAnalyzer()
+        
+        # Set up signal handlers for clean shutdown
+        signal.signal(signal.SIGINT, self._handle_sigint)
+        signal.signal(signal.SIGTERM, self._handle_sigint)
+    
+    def _handle_sigint(self, signum, frame):
+        """Handle SIGINT (Ctrl+C) gracefully."""
+        print("\nShutting down gracefully...")
+        if self.processor:
+            self.processor.stop_monitoring()
+        self.analyzer.close()
+        sys.exit(0)
+    
+    def parse_args(self):
+        """Parse command-line arguments."""
+        parser = argparse.ArgumentParser(
+            description="SecureNetMonitor - Advanced Network Security Monitoring Tool"
+        )
+        
+        subparsers = parser.add_subparsers(dest="command", help="Command to execute")
+        
+        # Monitor command
+        monitor_parser = subparsers.add_parser("monitor", help="Start network monitoring")
+        monitor_parser.add_argument(
+            "-i", "--interface", help="Network interface to monitor", default=None
+        )
+        monitor_parser.add_argument(
+            "-d", "--daemon", action="store_true", help="Run as a background daemon"
+        )
+        
+        # Report command
+        report_parser = subparsers.add_parser("report", help="Generate analysis report")
+        report_parser.add_argument(
+            "-o", "--output", help="Output file for report", default=None
+        )
+        
+        # Analyze command
+        analyze_parser = subparsers.add_parser("analyze", help="Analyze collected data")
+        analyze_parser.add_argument(
+            "--top", type=int, default=10, help="Number of top items to show"
+        )
+        
+        # Init command
+        init_parser = subparsers.add_parser("init", help="Initialize or reset the database")
+        
+        # List anomalies command
+        anomalies_parser = subparsers.add_parser("anomalies", help="List detected anomalies")
+        anomalies_parser.add_argument(
+            "-n", type=int, default=10, help="Number of anomalies to show"
+        )
+        
+        return parser.parse_args()
+    
+    def run_command(self, args):
+        """Run the specified command."""
+        if args.command == "monitor":
+            self._run_monitor(args.interface, args.daemon)
+        elif args.command == "report":
+            self._generate_report(args.output)
+        elif args.command == "analyze":
+            self._show_analysis(args.top)
+        elif args.command == "init":
+            self._init_database()
+        elif args.command == "anomalies":
+            self._show_anomalies(args.n)
+        else:
+            print("Please specify a command. Use --help for available commands.")
+    
+    def _run_monitor(self, interface, daemon):
+        """Start network monitoring."""
+        if daemon:
+            # TODO: Implement daemonization
+            print("Daemon mode not yet implemented")
+            return
+        
+        try:
+            self.processor = PacketProcessor()
+            self.processor.start_monitoring(interface)
+            
+            print("Network monitoring started. Press Ctrl+C to stop.")
+            # Keep running until interrupted
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("\nStopping network monitoring...")
+        finally:
+            if self.processor:
+                self.processor.stop_monitoring()
+    
+    def _generate_report(self, output_file):
+        """Generate and output an analysis report."""
+        report = self.analyzer.generate_report()
+        
+        if output_file:
+            with open(output_file, 'w') as f:
+                f.write(report)
+            print(f"Report saved to {output_file}")
+        else:
+            print(report)
+    
+    def _show_analysis(self, top_count):
+        """Show analysis of collected data."""
+        stats = self.analyzer.get_connection_stats()
+        
+        print("======== NETWORK ANALYSIS ========")
+        print(f"Total Connections: {stats['total_connections']}")
+        print(f"Total Data Transferred: {stats['total_bytes'] / (1024*1024):.2f} MB")
+        
+        print("\n--- TOP TALKERS ---")
+        for i, talker in enumerate(stats['top_talkers'][:top_count], 1):
+            print(f"{i}. {talker['src_ip']}: {talker['count']} connections")
+        
+        print("\n--- TOP DESTINATION PORTS ---")
+        for i, port in enumerate(stats['top_ports'][:top_count], 1):
+            print(f"{i}. Port {port['dst_port']}: {port['count']} connections")
+    
+    def _init_database(self):
+        """Initialize or reset the database."""
+        if os.path.exists(DB_PATH):
+            confirm = input("Database already exists. Reset it? (y/N): ")
+            if confirm.lower() != 'y':
+                print("Database initialization canceled.")
+                return
+            
+            # Close the current connection
+            self.analyzer.close()
+            
+            # Backup old database
+            backup_path = f"{DB_PATH}.{int(time.time())}.bak"
+            os.rename(DB_PATH, backup_path)
+            print(f"Existing database backed up to {backup_path}")
+        
+        # Initialize database
+        init_database()
+        print("Database initialized successfully")
+        
+        # Re-initialize analyzer connection
+        self.analyzer = NetworkAnalyzer()
+    
+    def _show_anomalies(self, count):
+        """Show detected anomalies."""
+        anomalies = self.analyzer.get_recent_anomalies(count)
+        
+        print("======== DETECTED ANOMALIES ========")
+        if not anomalies:
+            print("No anomalies detected")
+            return
+        
+        for i, anomaly in enumerate(anomalies, 1):
+            print(f"{i}. [{anomaly['timestamp']}] {anomaly['type']} (Severity: {anomaly['severity']}/5)")
+            print(f"   Details: {anomaly['details']}")
+            print()
+
+# ---------- Main Entry Point ----------
+def main():
+    """Main entry point for the script."""
+    # Ensure we have root privileges
+    if os.geteuid() != 0:
+        print("This script requires root privileges to capture and analyze network traffic.")
+        print("Please run with sudo or as root.")
+        sys.exit(1)
+    
+    # Initialize database if it doesn't exist
+    if not os.path.exists(DB_PATH):
+        init_database()
+    
+    # Create and run the CLI
+    cli = NetworkMonitorCLI()
+    args = cli.parse_args()
+    cli.run_command(args)
+
+if __name__ == "__main__":
+    main()
