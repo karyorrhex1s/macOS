@@ -172,3 +172,51 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# SecureNetMonitor specific exclusions
+# SQLite database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Backup database files
+*.db.*.bak
+
+# Generated reports
+*_report.txt
+reports/
+
+# User configuration files
+config.json
+user_config.py
+
+# Network capture files
+*.pcap
+*.pcapng
+
+# Sensitive data files that might be accidentally created
+*.keys
+*.pem
+*.key
+*.crt
+*.cert
+
+# Local network information files
+local_networks.txt
+network_config.json
+
+# Runtime files
+*.pid
+*.lock
+
+# Temporary files
+tmp/
+temp/
+.tmp/
+
+# Generated documentation
+docs/generated/
+
+# Development tools
+.vscode/
+.devcontainer/
