@@ -40,9 +40,11 @@ except ImportError:
     sys.exit(1)
 
 # ---------- Configuration ----------
+# IMPORTANT: Replace these paths with your own directory paths
 HOME_DIR = os.path.expanduser("~")
-CONFIG_DIR = os.path.join(HOME_DIR, "secOPS", "security", "config")
-LOG_DIR = os.path.join(HOME_DIR, "secOPS", "network", "logs")
+# TODO: Replace with your own directory paths
+CONFIG_DIR = os.path.join(HOME_DIR, "YOUR_CONFIG_DIRECTORY")  # Example: os.path.join(HOME_DIR, "secnetmon", "config")
+LOG_DIR = os.path.join(HOME_DIR, "YOUR_LOG_DIRECTORY")  # Example: os.path.join(HOME_DIR, "secnetmon", "logs")
 DB_PATH = os.path.join(CONFIG_DIR, "network_analysis.db")
 
 # Ensure directories exist
