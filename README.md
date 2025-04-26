@@ -167,4 +167,4 @@ SecureNetMonitor employs a modular, multi-threaded architecture:
 ## License
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 ## Disclaimer
-SecureNetMonitor is designed through assisted conceptual development for legitimate security research and network administration. Always ensure you have authorization to monitor any networks you don't own. Unauthorized network monitoring may be illegal in your jurisdiction.
+SecureNetMonitor was designed through assisted conceptual development for legitimate security research and network administration. Always ensure you have authorization to monitor any networks you don't own. Unauthorized network monitoring may be illegal in your jurisdiction.
